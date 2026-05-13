@@ -23,40 +23,74 @@ const notificationRoutes = require('./routes/notifications');
 // Import database connection
 const db = require('./config/database');
 
+const isVercel = Boolean(process.env.VERCEL);
+
 // Initialize Express app
 const app = express();
-const httpServer = createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
-    methods: ["GET", "POST"]
-  }
-});
+
+let httpServer = null;
+let io = null;
+
+if (!isVercel) {
+  httpServer = createServer(app);
+  io = new Server(httpServer, {
+    cors: {
+      origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+      methods: ['GET', 'POST']
+    }
+  });
+
+  io.on('connection', (socket) => {
+    console.log('User connected:', socket.id);
+
+    socket.on('join-room', (userId) => {
+      socket.join(`user-${userId}`);
+      console.log(`User ${userId} joined their room`);
+    });
+
+    socket.on('disconnect', () => {
+      console.log('User disconnected:', socket.id);
+    });
+  });
+
+  app.set('io', io);
+} else {
+  // Serverless: no persistent WebSocket server; no-op for any route that emits
+  app.set('io', {
+    to: () => ({ emit: () => {} })
+  });
+}
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Vercel serverless: connect Mongo once per warm instance (mongoose caches connection)
+if (isVercel) {
+  const ensureMongo = (() => {
+    let promise = null;
+    return () => {
+      if (!promise) {
+        promise = new Promise((resolve, reject) => {
+          db.connect((err) => (err ? reject(err) : resolve()));
+        });
+      }
+      return promise;
+    };
+  })();
+  app.use((req, res, next) => {
+    ensureMongo()
+      .then(() => next())
+      .catch((err) => {
+        console.error('Database connection failed:', err);
+        res.status(503).json({ message: 'Database unavailable', error: err.message });
+      });
+  });
+}
+
 // Serve static files (uploads)
 app.use('/uploads', express.static('uploads'));
-
-// Socket.IO for real-time notifications
-io.on('connection', (socket) => {
-  console.log('User connected:', socket.id);
-
-  socket.on('join-room', (userId) => {
-    socket.join(`user-${userId}`);
-    console.log(`User ${userId} joined their room`);
-  });
-
-  socket.on('disconnect', () => {
-    console.log('User disconnected:', socket.id);
-  });
-});
-
-// Make io available to routes
-app.set('io', io);
 
 // Routes
 app.use('/api/auth', authRoutes);
@@ -69,6 +103,11 @@ app.use('/api/feedback', feedbackRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/notifications', notificationRoutes);
+
+// Root (browser / health probes)
+app.get('/', (req, res) => {
+  res.json({ status: 'OK', service: 'lms-backend', health: '/api/health' });
+});
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
@@ -128,25 +167,28 @@ const findAvailablePort = async (startPort, maxRetries) => {
   throw new Error(`No free port found between ${startPort} and ${startPort + maxRetries}`);
 };
 
-db.connect((err) => {
-  if (err) {
-    console.error('Database connection failed:', err);
-    process.exit(1);
-  }
-  console.log('Database connected successfully');
-
-  findAvailablePort(PORT, MAX_PORT_RETRIES)
-    .then((availablePort) => {
-      httpServer.listen(availablePort, () => {
-        console.log(`Server running on port ${availablePort}`);
-        console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-      });
-    })
-    .catch((error) => {
-      console.error('Server failed to start:', error.message);
+if (!isVercel) {
+  db.connect((err) => {
+    if (err) {
+      console.error('Database connection failed:', err);
       process.exit(1);
-    });
-});
+    }
+    console.log('Database connected successfully');
 
-module.exports = { app, io };
+    findAvailablePort(PORT, MAX_PORT_RETRIES)
+      .then((availablePort) => {
+        httpServer.listen(availablePort, () => {
+          console.log(`Server running on port ${availablePort}`);
+          console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+        });
+      })
+      .catch((error) => {
+        console.error('Server failed to start:', error.message);
+        process.exit(1);
+      });
+  });
+}
+
+// Vercel serverless requires default export: Express app (not an object)
+module.exports = app;
 
