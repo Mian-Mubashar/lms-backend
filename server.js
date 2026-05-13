@@ -189,6 +189,10 @@ if (!isVercel) {
   });
 }
 
-// Vercel serverless requires default export: Express app (not an object)
-module.exports = app;
+// Vercel: zero-config Express expects default export = function or http.Server.
+// Some builders mis-detect `app` as non-function; exporting an explicit listener is safest.
+const vercelHandler = (req, res) => app(req, res);
+module.exports = vercelHandler;
+module.exports.default = vercelHandler;
+module.exports.app = app;
 
