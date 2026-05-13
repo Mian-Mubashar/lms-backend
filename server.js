@@ -5,8 +5,9 @@ const { createServer } = require('http');
 const net = require('net');
 const { Server } = require('socket.io');
 
-// Load environment variables
+// Load environment variables (Vercel injects env; local uses .env.runtime then .env)
 dotenv.config({ path: '.env.runtime', override: true });
+dotenv.config({ override: false });
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -189,10 +190,17 @@ if (!isVercel) {
   });
 }
 
-// Vercel: zero-config Express expects default export = function or http.Server.
-// Some builders mis-detect `app` as non-function; exporting an explicit listener is safest.
-const vercelHandler = (req, res) => app(req, res);
-module.exports = vercelHandler;
-module.exports.default = vercelHandler;
-module.exports.app = app;
+// Vercel serverless: runtime expects default export to be a **function** OR an **http.Server**.
+// Exporting `app` alone fails some checks; `http.createServer(app)` is always recognized as a server.
+if (isVercel) {
+  const server = createServer(app);
+  module.exports = server;
+  module.exports.default = server;
+  module.exports.app = app;
+} else {
+  const handler = (req, res) => app(req, res);
+  module.exports = handler;
+  module.exports.default = handler;
+  module.exports.app = app;
+}
 
