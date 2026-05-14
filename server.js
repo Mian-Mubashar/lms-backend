@@ -28,6 +28,9 @@ const isVercel = Boolean(process.env.VERCEL);
 // Initialize Express app
 const app = express();
 
+const { installCors, applyCorsHeaders } = require('./middleware/cors');
+installCors(app);
+
 let httpServer = null;
 let io = null;
 
@@ -60,11 +63,6 @@ if (!isVercel) {
     to: () => ({ emit: () => {} })
   });
 }
-
-const { installCors, applyCorsHeaders } = require('./middleware/cors');
-
-// CORS first (Vercel serverless + split frontend/backend + OPTIONS preflight)
-installCors(app);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
