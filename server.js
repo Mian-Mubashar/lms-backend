@@ -1,5 +1,4 @@
 const express = require('express');
-const cors = require('cors');
 const dotenv = require('dotenv');
 const { createServer } = require('http');
 const net = require('net');
@@ -62,51 +61,11 @@ if (!isVercel) {
   });
 }
 
-// CORS: split Vercel frontend/backend — answer OPTIONS first, echo request headers for preflight
-app.use((req, res, next) => {
-  if (req.method !== 'OPTIONS') return next();
+const { installCors } = require('./middleware/cors');
 
-  const origin = req.headers.origin;
-  if (origin) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-  } else {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-  }
+// CORS first (Vercel serverless + split frontend/backend + OPTIONS preflight)
+installCors(app);
 
-  res.setHeader(
-    'Access-Control-Allow-Methods',
-    'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS'
-  );
-
-  const requestedHeaders = req.headers['access-control-request-headers'];
-  res.setHeader(
-    'Access-Control-Allow-Headers',
-    requestedHeaders ||
-      'Content-Type, Authorization, X-Requested-With, Accept, Origin'
-  );
-  res.setHeader('Access-Control-Max-Age', '86400');
-  return res.sendStatus(204);
-});
-
-app.use(
-  cors({
-    origin: (callbackOrigin, cb) => cb(null, true),
-    methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'X-Requested-With',
-      'Accept',
-      'Origin',
-      'Access-Control-Request-Method',
-      'Access-Control-Request-Headers'
-    ],
-    exposedHeaders: ['Content-Type'],
-    optionsSuccessStatus: 204,
-    maxAge: 86400
-  })
-);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
