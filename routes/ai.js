@@ -1,12 +1,20 @@
 const express = require('express');
-const { authenticate } = require('../middleware/auth');
+const { authenticate, authorize } = require('../middleware/auth');
 const dotenv = require('dotenv');
 const OpenAI = require('openai');
 const { Pinecone } = require('@pinecone-database/pinecone');
 const pdfParse = require('pdf-parse');
 const fs = require('fs');
 const path = require('path');
-const { Course, Enrollment, CourseMaterial } = require('../models');
+const {
+  Course,
+  Enrollment,
+  CourseMaterial,
+  User,
+  Assignment,
+  AssignmentSubmission,
+  Quiz
+} = require('../models');
 
 const router = express.Router();
 
@@ -63,6 +71,27 @@ const getOpenAIClient = () => {
   openaiApiKeyCache = key;
   return openai;
 };
+
+/** OpenAI chat often wraps JSON in markdown; model may add prose — extract object safely. */
+function parseAssistantJson(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  let t = raw.trim();
+  t = t.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim();
+  try {
+    return JSON.parse(t);
+  } catch (_) {
+    const start = t.indexOf('{');
+    const end = t.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+      try {
+        return JSON.parse(t.slice(start, end + 1));
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+  return null;
+}
 
 // Lazy initialization function for Pinecone
 let pinecone = null;
@@ -1216,6 +1245,226 @@ Goal: ${goal}`
     });
   } catch (error) {
     console.error('AI study coach error:', error);
+    return res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+async function buildAdminPlatformSnapshot() {
+  const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const [
+    totalUsers,
+    totalCourses,
+    totalEnrollments,
+    distinctStudents,
+    usersByRole,
+    coursesByStatus,
+    newUsersWeek,
+    ungradedSubmissions,
+    totalAssignments,
+    totalQuizzes
+  ] = await Promise.all([
+    User.countDocuments(),
+    Course.countDocuments(),
+    Enrollment.countDocuments(),
+    Enrollment.distinct('studentId').then((ids) => ids.length),
+    User.aggregate([{ $group: { _id: '$role', count: { $sum: 1 } } }]),
+    Course.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
+    User.countDocuments({ createdAt: { $gte: weekAgo } }),
+    AssignmentSubmission.countDocuments({ score: null }),
+    Assignment.countDocuments(),
+    Quiz.countDocuments()
+  ]);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    totalUsers,
+    totalCourses,
+    totalEnrollments,
+    activeStudents: distinctStudents,
+    usersByRole: usersByRole.map((x) => ({ role: x._id || 'unknown', count: x.count })),
+    coursesByStatus: coursesByStatus.map((x) => ({ status: x._id || 'unknown', count: x.count })),
+    newUsersLast7Days: newUsersWeek,
+    ungradedSubmissions,
+    totalAssignments,
+    totalQuizzes
+  };
+}
+
+/**
+ * @route   POST /api/ai/admin/platform-brief
+ * @desc    AI executive brief from live Mongo stats (admin only)
+ * @access  Admin
+ */
+router.post('/admin/platform-brief', authorize('admin'), async (req, res) => {
+  try {
+    const { focus = '' } = req.body;
+    const snapshot = await buildAdminPlatformSnapshot();
+    const openaiClient = getOpenAIClient();
+
+    const fallback = {
+      source: 'fallback',
+      title: 'Platform snapshot',
+      executiveSummary: `The LMS currently has ${snapshot.totalUsers} users, ${snapshot.totalCourses} courses, and ${snapshot.totalEnrollments} enrollments. About ${snapshot.activeStudents} distinct students are enrolled. Ungraded assignment submissions: ${snapshot.ungradedSubmissions}. New accounts in the last 7 days: ${snapshot.newUsersLast7Days}.`,
+      priorities: [
+        snapshot.ungradedSubmissions > 0
+          ? 'Align with instructors on grading backlog and deadlines'
+          : 'Grading backlog is clear — keep monitoring weekly',
+        snapshot.newUsersLast7Days > 0
+          ? 'Onboard new users with a short welcome checklist'
+          : 'Consider campaigns or partnerships to grow signups',
+        'Review role distribution and course publish pipeline in Analytics / Courses'
+      ],
+      watchlist: [
+        'Watch for sudden spikes in pending submissions before exam windows',
+        'Ensure archived vs published course ratio matches your governance policy'
+      ],
+      nextSteps: ['Open Analytics for trends', 'Open Users to verify roles', 'Spot-check high-enrollment courses']
+    };
+
+    if (!openaiClient) {
+      return res.json({ ...fallback, snapshot });
+    }
+
+    const adminModel = resolveEnvValue('OPENAI_ADMIN_MODEL') || 'gpt-4o-mini';
+    let completion;
+    try {
+      completion = await openaiClient.chat.completions.create({
+      model: adminModel,
+      messages: [
+        {
+          role: 'system',
+          content: `You are an LMS platform administrator advisor.
+Return ONLY JSON with keys:
+title (string),
+executiveSummary (string, 3-5 sentences, plain text),
+priorities (array of 3-5 short actionable strings for the admin),
+watchlist (array of 2-4 potential risks or things to monitor),
+nextSteps (array of 3-5 concrete admin tasks).
+Use only the facts from the snapshot JSON; do not invent numbers. If an optional admin focus is provided, reflect it in priorities or nextSteps.`
+        },
+        {
+          role: 'user',
+          content: `Snapshot JSON:\n${JSON.stringify(snapshot)}\n\nAdmin focus (optional):\n${String(focus || '').trim() || '(none)'}`
+        }
+      ],
+      temperature: 0.35,
+      max_tokens: 900,
+      response_format: { type: 'json_object' }
+    });
+    } catch (apiErr) {
+      console.warn('AI admin platform-brief OpenAI call failed:', apiErr.message);
+      return res.json({
+        ...fallback,
+        snapshot,
+        source: 'fallback',
+        note: apiErr.message || 'OpenAI request failed'
+      });
+    }
+
+    const raw = completion.choices[0]?.message?.content?.trim() || '';
+    const parsed = parseAssistantJson(raw);
+    if (!parsed) {
+      console.warn('AI admin platform-brief: non-JSON model output');
+      return res.json({
+        ...fallback,
+        snapshot,
+        source: 'fallback',
+        note: 'Could not parse AI response; showing default brief.'
+      });
+    }
+    return res.json({
+      source: 'openai',
+      title: parsed.title || fallback.title,
+      executiveSummary: parsed.executiveSummary || fallback.executiveSummary,
+      priorities: Array.isArray(parsed.priorities) ? parsed.priorities : fallback.priorities,
+      watchlist: Array.isArray(parsed.watchlist) ? parsed.watchlist : fallback.watchlist,
+      nextSteps: Array.isArray(parsed.nextSteps) ? parsed.nextSteps : fallback.nextSteps,
+      snapshot
+    });
+  } catch (error) {
+    console.error('AI admin platform brief error:', error);
+    return res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+/**
+ * @route   POST /api/ai/admin/announcement-draft
+ * @desc    Draft admin announcements (maintenance, policy, events)
+ * @access  Admin
+ */
+router.post('/admin/announcement-draft', authorize('admin'), async (req, res) => {
+  try {
+    const { topic = '', audience = 'all_users', tone = 'professional', context = '', channel = 'in-app' } = req.body;
+
+    if (!String(topic).trim()) {
+      return res.status(400).json({ message: 'Topic is required' });
+    }
+
+    const openaiClient = getOpenAIClient();
+    const t = topic.trim();
+    const fallback = {
+      source: 'fallback',
+      title: `Notice: ${t.slice(0, 72)}${t.length > 72 ? '…' : ''}`,
+      body: `We are sharing an important update: ${t}.\n\nPlease read this carefully and follow any instructions from your instructors or administrators. If you have questions, use the usual support channel.\n\nThank you,\nLMS Administration`,
+      shortBlurb: t.length > 150 ? `${t.slice(0, 147)}…` : t
+    };
+
+    if (!openaiClient) {
+      return res.json(fallback);
+    }
+
+    const adminModel = resolveEnvValue('OPENAI_ADMIN_MODEL') || 'gpt-4o-mini';
+    let completion;
+    try {
+      completion = await openaiClient.chat.completions.create({
+      model: adminModel,
+      messages: [
+        {
+          role: 'system',
+          content: `You draft concise LMS administrator announcements.
+Return ONLY JSON with keys:
+title (string, max ~90 chars),
+body (string, 2-4 short paragraphs, plain text, suitable for email or in-app notice),
+shortBlurb (string, one line, max ~180 chars for SMS/push preview).
+Tone: professional | friendly | urgent. Audience: all_users | students | teachers.
+Do not use markdown code fences inside JSON string values.`
+        },
+        {
+          role: 'user',
+          content: `Topic: ${t}\nAudience: ${audience}\nTone: ${tone}\nChannel: ${channel}\nExtra context:\n${String(context || '').trim() || '(none)'}`
+        }
+      ],
+      temperature: 0.45,
+      max_tokens: 700,
+      response_format: { type: 'json_object' }
+    });
+    } catch (apiErr) {
+      console.warn('AI admin announcement-draft OpenAI call failed:', apiErr.message);
+      return res.json({
+        ...fallback,
+        source: 'fallback',
+        note: apiErr.message || 'OpenAI request failed'
+      });
+    }
+
+    const raw = completion.choices[0]?.message?.content?.trim() || '';
+    const parsed = parseAssistantJson(raw);
+    if (!parsed) {
+      console.warn('AI admin announcement-draft: non-JSON model output, raw length', raw.length);
+      return res.json({
+        ...fallback,
+        source: 'fallback',
+        note: 'Could not parse AI response; showing template draft.'
+      });
+    }
+    return res.json({
+      source: 'openai',
+      title: parsed.title || fallback.title,
+      body: parsed.body || fallback.body,
+      shortBlurb: parsed.shortBlurb || fallback.shortBlurb
+    });
+  } catch (error) {
+    console.error('AI admin announcement draft error:', error);
     return res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
