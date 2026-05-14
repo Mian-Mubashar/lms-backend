@@ -62,8 +62,16 @@ if (!isVercel) {
   });
 }
 
-// Middleware
-app.use(cors());
+// Middleware — explicit CORS so browser preflight from any Vercel / local frontend gets headers
+app.use(
+  cors({
+    origin: true,
+    methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    optionsSuccessStatus: 204,
+    maxAge: 86400
+  })
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
