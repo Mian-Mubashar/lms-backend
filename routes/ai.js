@@ -356,18 +356,13 @@ router.post('/text-to-speech', async (req, res) => {
     buffer = Buffer.from(await mp3.arrayBuffer());
     audioFormat = 'mp3';
 
-    // Save audio file
-    const audioDir = 'uploads/audio';
-    if (!fs.existsSync(audioDir)) {
-      fs.mkdirSync(audioDir, { recursive: true });
-    }
-
-    const filename = `tts-${Date.now()}.${audioFormat}`;
-    const filepath = path.join(audioDir, filename);
-    fs.writeFileSync(filepath, buffer);
+    // Instead of saving to the filesystem (which fails on Vercel's read-only filesystem),
+    // we return the audio as a Base64 data URI so the frontend can play it directly.
+    const base64Audio = buffer.toString('base64');
+    const audioDataUri = `data:audio/${audioFormat};base64,${base64Audio}`;
 
     res.json({ 
-      audioUrl: `/uploads/audio/${filename}`,
+      audioUrl: audioDataUri,
       provider: 'openai',
       format: audioFormat,
       message: 'Text converted to speech successfully using OpenAI'
