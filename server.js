@@ -81,6 +81,15 @@ if (isVercel) {
     };
   })();
   app.use((req, res, next) => {
+    if (req.method === 'OPTIONS') return next();
+    if (
+      req.method === 'GET' &&
+      (req.path === '/' ||
+        req.path === '/favicon.ico' ||
+        req.path === '/api/health')
+    ) {
+      return next();
+    }
     ensureMongo()
       .then(() => next())
       .catch((err) => {
@@ -107,11 +116,26 @@ app.use('/api/notifications', notificationRoutes);
 
 // Root (browser / health probes)
 app.get('/', (req, res) => {
+  if (isVercel && !db.getMongoUri()) {
+    return res.status(200).json({
+      status: 'misconfigured',
+      service: 'lms-backend',
+      message:
+        'Set MONGODB_URI (MongoDB Atlas) in Vercel → Settings → Environment Variables, then redeploy.',
+      health: '/api/health'
+    });
+  }
   res.json({ status: 'OK', service: 'lms-backend', health: '/api/health' });
 });
 
 // Health check endpoint
 app.get('/api/health', (req, res) => {
+  if (isVercel && !db.getMongoUri()) {
+    return res.status(503).json({
+      status: 'degraded',
+      message: 'LMS API is up but database is not configured (missing MONGODB_URI or MONGO_URI).'
+    });
+  }
   res.json({ status: 'OK', message: 'LMS API is running' });
 });
 
