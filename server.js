@@ -61,7 +61,7 @@ if (!isVercel) {
   });
 }
 
-const { installCors } = require('./middleware/cors');
+const { installCors, applyCorsHeaders } = require('./middleware/cors');
 
 // CORS first (Vercel serverless + split frontend/backend + OPTIONS preflight)
 installCors(app);
@@ -96,6 +96,7 @@ if (isVercel) {
       .then(() => next())
       .catch((err) => {
         console.error('Database connection failed:', err);
+        applyCorsHeaders(req, res);
         res.status(503).json({ message: 'Database unavailable', error: err.message });
       });
   });

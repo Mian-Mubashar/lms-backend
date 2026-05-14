@@ -1,14 +1,12 @@
-const cors = require('cors');
-
 /**
- * Production CORS for split Vercel (frontend + backend) + local MERN dev.
+ * Vercel serverless + split MERN: CORS headers on every response (incl. 503 JSON),
+ * so the browser never sees "No Access-Control-Allow-Origin" on preflight or errors.
  *
- * Env:
- *   FRONTEND_URL   — primary production frontend, e.g. https://lms-frontend-six-silk.vercel.app
- *   CORS_ORIGINS   — optional comma-separated extra origins (staging, custom domain)
- *
- * Also allows any *.vercel.app (preview deployments) and localhost in non-production.
+ * Default: permissive for typical deploys (any Origin with browser + *.vercel.app / localhost).
+ * Set CORS_STRICT=1 + FRONTEND_URL (+ optional CORS_ORIGINS) to lock down.
  */
+
+const cors = require('cors');
 
 function normalizeOrigin(url) {
   if (!url || typeof url !== 'string') return null;
@@ -16,7 +14,7 @@ function normalizeOrigin(url) {
   return t || null;
 }
 
-function collectAllowedOrigins() {
+function buildAllowlist() {
   const set = new Set();
   const add = (u) => {
     const n = normalizeOrigin(u);
@@ -35,13 +33,27 @@ function collectAllowedOrigins() {
   return set;
 }
 
-const allowedExact = collectAllowedOrigins();
+const allowExact = buildAllowlist();
+const strict =
+  String(process.env.CORS_STRICT || '').toLowerCase() === '1' ||
+  String(process.env.CORS_STRICT || '').toLowerCase() === 'true';
 
 function isOriginAllowed(origin) {
+  if (!strict) {
+    if (!origin) return true;
+    try {
+      const { hostname } = new URL(origin);
+      if (hostname.endsWith('.vercel.app') || hostname === 'vercel.app') return true;
+      if (hostname === 'localhost' || hostname === '127.0.0.1') return true;
+    } catch {
+      return false;
+    }
+    return true;
+  }
   if (!origin) return true;
-  const normalized = normalizeOrigin(origin);
-  if (!normalized) return true;
-  if (allowedExact.has(normalized)) return true;
+  const n = normalizeOrigin(origin);
+  if (!n) return true;
+  if (allowExact.has(n)) return true;
   try {
     const { hostname } = new URL(origin);
     if (hostname.endsWith('.vercel.app') || hostname === 'vercel.app') return true;
@@ -52,70 +64,60 @@ function isOriginAllowed(origin) {
   return false;
 }
 
-const corsOptions = {
-  origin(origin, callback) {
-    if (isOriginAllowed(origin)) {
-      callback(null, true);
-    } else {
-      callback(null, false);
-    }
-  },
-  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
-  allowedHeaders: [
-    'Content-Type',
-    'Authorization',
-    'Accept',
-    'Origin',
-    'X-Requested-With',
-    'Access-Control-Request-Method',
-    'Access-Control-Request-Headers'
-  ],
-  exposedHeaders: ['Content-Type'],
-  optionsSuccessStatus: 204,
-  maxAge: 86400,
-  credentials: false
-};
-
-/**
- * Answer OPTIONS before body parsers / DB — echo Access-Control-Request-Headers
- * so Chrome preflight always matches.
- */
-function preflight(req, res, next) {
-  if (req.method !== 'OPTIONS') return next();
-
+function applyCorsHeaders(req, res) {
   const origin = req.headers.origin;
-  if (!isOriginAllowed(origin)) {
-    return res.sendStatus(403);
-  }
+  const allowed = !origin || isOriginAllowed(origin);
 
-  if (origin) {
+  if (origin && allowed) {
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Vary', 'Origin');
   } else {
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
 
-  res.setHeader('Access-Control-Allow-Methods', corsOptions.methods.join(','));
-
+  res.setHeader(
+    'Access-Control-Allow-Methods',
+    'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS'
+  );
   const requested = req.headers['access-control-request-headers'];
   res.setHeader(
     'Access-Control-Allow-Headers',
-    requested || corsOptions.allowedHeaders.join(',')
+    requested ||
+      'Content-Type, Authorization, Accept, Origin, X-Requested-With, Access-Control-Request-Method, Access-Control-Request-Headers'
   );
-  res.setHeader('Access-Control-Max-Age', String(corsOptions.maxAge));
-  return res.sendStatus(204);
+  res.setHeader('Access-Control-Max-Age', '86400');
 }
 
-const corsHandler = cors(corsOptions);
+function universalCors(req, res, next) {
+  applyCorsHeaders(req, res);
 
-/** Apply in order: preflight first, then cors() for non-OPTIONS responses. */
+  if (req.method === 'OPTIONS') {
+    const origin = req.headers.origin;
+    if (origin && !isOriginAllowed(origin)) {
+      return res.sendStatus(403);
+    }
+    return res.sendStatus(204);
+  }
+
+  next();
+}
+
+const laxCors = cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    if (isOriginAllowed(origin)) return cb(null, true);
+    return cb(null, false);
+  },
+  credentials: false
+});
+
 function installCors(app) {
-  app.use(preflight);
-  app.use(corsHandler);
+  app.use(universalCors);
+  app.use(laxCors);
 }
 
 module.exports = {
   installCors,
-  corsOptions,
-  isOriginAllowed
+  isOriginAllowed,
+  applyCorsHeaders
 };
