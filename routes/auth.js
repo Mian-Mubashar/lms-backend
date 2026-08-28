@@ -3,7 +3,8 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { authenticate } = require('../middleware/auth');
 const { body, validationResult } = require('express-validator');
-const { User, PasswordReset } = require('../models');
+const { User, PasswordReset, TeacherApplication, Notification } = require('../models');
+const { isEmailConfigured, sendPasswordResetEmail } = require('../lib/email');
 
 const router = express.Router();
 PasswordReset.collection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {});
@@ -26,7 +27,9 @@ router.post('/register', [
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const { email, password, firstName, lastName, role = 'student' } = req.body;
+    const { email, password, firstName, lastName, role: requestedRole = 'student' } = req.body;
+    const role = 'student';
+    let teacherApplicationPending = false;
 
     // Check if user exists
     const existingUser = await User.findOne({ email }).lean();
@@ -37,9 +40,29 @@ router.post('/register', [
     // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Create user
+    // Create user (public signup is always student)
     const user = await User.create({ email, password: hashedPassword, firstName, lastName, role });
     const userId = user._id.toString();
+
+    if (requestedRole === 'teacher') {
+      await TeacherApplication.create({
+        userId: user._id,
+        message: 'Teacher account requested during signup.'
+      });
+      teacherApplicationPending = true;
+
+      const admins = await User.find({ role: 'admin' }).select('_id').lean();
+      if (admins.length) {
+        await Notification.insertMany(
+          admins.map((admin) => ({
+            userId: admin._id,
+            title: 'New teacher application',
+            message: `${firstName} ${lastName} (${email}) signed up as a teacher and needs approval.`,
+            type: 'info'
+          }))
+        );
+      }
+    }
 
     // Generate JWT token
     const token = jwt.sign(
@@ -49,8 +72,11 @@ router.post('/register', [
     );
 
     res.status(201).json({
-      message: 'User registered successfully',
+      message: teacherApplicationPending
+        ? 'Account created. Your teacher request was sent to admin for approval.'
+        : 'User registered successfully',
       token,
+      teacherApplicationPending,
       user: {
         id: userId.toString(),
         email,
@@ -163,25 +189,47 @@ router.post('/forgot-password', [
     }
 
     const { email } = req.body;
+    const normalizedEmail = String(email).trim().toLowerCase();
 
-    // Always use generic response message for security
-    const genericMessage = 'If this email exists, a reset code has been generated.';
-
-    const user = await User.findOne({ email }).lean();
+    const user = await User.findOne({ email: normalizedEmail }).lean();
     if (!user) {
-      return res.json({ message: genericMessage });
+      return res.status(404).json({
+        message: 'No account found with this email. Please use the email you registered with.',
+        emailSent: false
+      });
+    }
+
+    if (!isEmailConfigured()) {
+      console.error('Forgot password: set SMTP_USER/SMTP_PASSWORD in backend .env');
+      return res.status(503).json({
+        message: 'We could not send the reset email right now. Please try again in a few minutes or contact support.',
+        emailSent: false
+      });
     }
 
     const resetCode = String(Math.floor(100000 + Math.random() * 900000));
-    const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 min
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
-    await PasswordReset.deleteMany({ email });
-    await PasswordReset.create({ email, resetCode, expiresAt, used: false });
+    await PasswordReset.findOneAndUpdate(
+      { email: normalizedEmail },
+      { email: normalizedEmail, resetCode, expiresAt, used: false },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
 
-    // For local/dev usability (no SMTP configured), return code in response.
+    const payload = {
+      to: normalizedEmail,
+      resetCode,
+      firstName: user.firstName || 'User'
+    };
+
     res.json({
-      message: genericMessage,
-      resetCode
+      message: 'Reset code sent! It usually arrives within 1 minute. Check inbox and spam.',
+      emailSent: true
+    });
+
+    sendPasswordResetEmail(payload).catch(async (error) => {
+      await PasswordReset.deleteMany({ email: normalizedEmail });
+      console.error('Password reset email failed:', error.message);
     });
   } catch (error) {
     console.error('Forgot password error:', error);
@@ -206,14 +254,15 @@ router.post('/reset-password', [
     }
 
     const { email, code, newPassword } = req.body;
+    const normalizedEmail = String(email).trim().toLowerCase();
 
-    const user = await User.findOne({ email });
+    const user = await User.findOne({ email: normalizedEmail });
     if (!user) {
       return res.status(400).json({ message: 'Invalid reset request' });
     }
 
     const reset = await PasswordReset.findOne({
-      email,
+      email: normalizedEmail,
       resetCode: code,
       used: false,
       expiresAt: { $gte: new Date() }

@@ -823,61 +823,106 @@ router.post('/suggest-attendance-note', async (req, res) => {
  * @desc    Generate role-based dashboard insights
  * @access  Private
  */
+const buildDashboardInsightsFallback = (analytics = {}, role = 'student') => {
+  if (role === 'admin') {
+    return [
+      `Platform has ${analytics.totalUsers || 0} users and ${analytics.totalCourses || 0} courses — review growth in Analytics.`,
+      `${analytics.totalEnrollments || 0} enrollments active — spot-check courses with low completion.`,
+      'Use Users and Courses pages weekly to keep roles and publish status healthy.'
+    ];
+  }
+
+  if (role === 'teacher') {
+    return [
+      `${analytics.pendingSubmissions || 0} submissions need grading — clear the backlog to keep students on track.`,
+      `You manage ${analytics.totalCourses || 0} course(s) with ${analytics.totalStudents || 0} student(s).`,
+      'Add a short quiz or assignment this week to maintain engagement.'
+    ];
+  }
+
+  const progress = Array.isArray(analytics.progressByCourse) ? analytics.progressByCourse : [];
+  const lowest = progress.length
+    ? [...progress].sort((a, b) => (a.progress || 0) - (b.progress || 0))[0]
+    : null;
+
+  return [
+    lowest
+      ? `"${lowest.title}" is at ${lowest.progress || 0}% — dedicate time this week to raise progress.`
+      : `You are enrolled in ${analytics.enrolledCourses || 0} course(s) — open Courses and continue learning.`,
+    (analytics.submittedAssignments || 0) === 0
+      ? 'Submit your first assignment to start building your score history.'
+      : `You have ${analytics.submittedAssignments} assignment submission(s) — review feedback and improve.`,
+    (analytics.completedCourses || 0) > 0
+      ? `Great work completing ${analytics.completedCourses} course(s). Pick the next module to keep momentum.`
+      : 'Set a weekly study goal (e.g. 3 sessions) to move toward course completion.'
+  ];
+};
+
+const isOpenAIQuotaError = (error) => {
+  const code = error?.code || error?.error?.code || '';
+  const type = error?.type || error?.error?.type || '';
+  return (
+    code === 'insufficient_quota' ||
+    code === 'credit_balance_exhausted' ||
+    type === 'insufficient_quota'
+  );
+};
+
 router.post('/dashboard-insights', async (req, res) => {
   try {
     const openaiClient = getOpenAIClient();
     const { analytics = {}, role = req.user.role } = req.body;
-    const summaryText = JSON.stringify(analytics);
+    const fallbackInsights = buildDashboardInsightsFallback(analytics, role);
 
     if (!openaiClient) {
-      return res.json({
-        source: 'fallback',
-        insights: [
-          'Review low-performing areas and prioritize improvement actions.',
-          'Focus on consistency: keep regular assignment/quiz cadence.',
-          'Track progress weekly and intervene early where needed.'
-        ]
-      });
+      return res.json({ source: 'fallback', insights: fallbackInsights });
     }
 
-    const completion = await openaiClient.chat.completions.create({
-      model: 'gpt-4',
-      messages: [
-        { role: 'system', content: 'You are an LMS analyst. Return ONLY JSON array of 3 concise actionable insights.' },
-        { role: 'user', content: `Role: ${role}\nAnalytics: ${summaryText}` }
-      ],
-      temperature: 0.6,
-      max_tokens: 220
-    });
+    const summaryText = JSON.stringify(analytics);
+    const insightModel = resolveEnvValue('OPENAI_ADMIN_MODEL') || 'gpt-4o-mini';
 
-    const raw = completion.choices[0].message.content.trim();
-    const parsed = JSON.parse(raw.replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim());
+    try {
+      const completion = await openaiClient.chat.completions.create({
+        model: insightModel,
+        messages: [
+          { role: 'system', content: 'You are an LMS analyst. Return ONLY JSON array of 3 concise actionable insights.' },
+          { role: 'user', content: `Role: ${role}\nAnalytics: ${summaryText}` }
+        ],
+        temperature: 0.6,
+        max_tokens: 220
+      });
 
-    const normalizedInsights = (Array.isArray(parsed) ? parsed : [])
-      .map((item) => {
-        if (typeof item === 'string') {
-          return item.trim();
-        }
-        if (item && typeof item === 'object') {
-          return (item.insight || item.text || item.recommendation || '').toString().trim();
-        }
-        return '';
-      })
-      .filter(Boolean)
-      .slice(0, 3);
+      const raw = completion.choices[0].message.content.trim();
+      const parsed = JSON.parse(raw.replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim());
 
-    if (normalizedInsights.length === 0) {
+      const normalizedInsights = (Array.isArray(parsed) ? parsed : [])
+        .map((item) => {
+          if (typeof item === 'string') {
+            return item.trim();
+          }
+          if (item && typeof item === 'object') {
+            return (item.insight || item.text || item.recommendation || '').toString().trim();
+          }
+          return '';
+        })
+        .filter(Boolean)
+        .slice(0, 3);
+
+      if (normalizedInsights.length === 0) {
+        return res.json({ source: 'fallback_on_parse', insights: fallbackInsights });
+      }
+
+      return res.json({ source: 'openai', insights: normalizedInsights });
+    } catch (openaiError) {
+      console.warn('OpenAI dashboard insights failed, using fallback:', openaiError.message);
       return res.json({
-        source: 'fallback_on_parse',
-        insights: [
-          'Review low-performing areas and prioritize improvement actions.',
-          'Focus on consistency: keep regular assignment/quiz cadence.',
-          'Track progress weekly and intervene early where needed.'
-        ]
+        source: isOpenAIQuotaError(openaiError) ? 'fallback_quota' : 'fallback_on_error',
+        insights: fallbackInsights,
+        notice: isOpenAIQuotaError(openaiError)
+          ? 'AI credits unavailable — showing smart suggestions from your dashboard data.'
+          : undefined
       });
     }
-
-    return res.json({ source: 'openai', insights: normalizedInsights });
   } catch (error) {
     console.error('Dashboard insights error:', error);
     return res.status(500).json({ message: 'Server error', error: error.message });

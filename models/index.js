@@ -140,6 +140,16 @@ const passwordResetSchema = new mongoose.Schema({
   used: { type: Boolean, default: false }
 }, baseOptions);
 
+const teacherApplicationSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  message: { type: String, default: '', maxlength: 1000 },
+  status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending', index: true },
+  reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  reviewedAt: { type: Date, default: null },
+  adminNote: { type: String, default: '' }
+}, baseOptions);
+teacherApplicationSchema.index({ userId: 1, status: 1 });
+
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 const Course = mongoose.models.Course || mongoose.model('Course', courseSchema);
 const Enrollment = mongoose.models.Enrollment || mongoose.model('Enrollment', enrollmentSchema);
@@ -153,6 +163,7 @@ const Attendance = mongoose.models.Attendance || mongoose.model('Attendance', at
 const Feedback = mongoose.models.Feedback || mongoose.model('Feedback', feedbackSchema);
 const Notification = mongoose.models.Notification || mongoose.model('Notification', notificationSchema);
 const PasswordReset = mongoose.models.PasswordReset || mongoose.model('PasswordReset', passwordResetSchema);
+const TeacherApplication = mongoose.models.TeacherApplication || mongoose.model('TeacherApplication', teacherApplicationSchema);
 
 module.exports = {
   mongoose,
@@ -168,5 +179,6 @@ module.exports = {
   Attendance,
   Feedback,
   Notification,
-  PasswordReset
+  PasswordReset,
+  TeacherApplication
 };

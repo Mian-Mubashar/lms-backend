@@ -1,7 +1,4 @@
-/**
- * Shared env + Mongo wiring for CLI seeders / one-off imports.
- * Always run via `npm run …` from the `backend` folder so `process.cwd()` is correct.
- */
+
 const path = require('path');
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');

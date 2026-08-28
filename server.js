@@ -1,12 +1,9 @@
 const express = require('express');
-const dotenv = require('dotenv');
+const { loadEnv } = require('./lib/loadEnv');
+loadEnv();
 const { createServer } = require('http');
 const net = require('net');
 const { Server } = require('socket.io');
-
-// Load environment variables (Vercel injects env; local uses .env.runtime then .env)
-dotenv.config({ path: '.env.runtime', override: true });
-dotenv.config({ override: false });
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -19,6 +16,7 @@ const feedbackRoutes = require('./routes/feedback');
 const aiRoutes = require('./routes/ai');
 const analyticsRoutes = require('./routes/analytics');
 const notificationRoutes = require('./routes/notifications');
+const teacherApplicationRoutes = require('./routes/teacherApplications');
 
 // Import database connection
 const db = require('./config/database');
@@ -114,6 +112,7 @@ app.use('/api/feedback', feedbackRoutes);
 app.use('/api/ai', aiRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/notifications', notificationRoutes);
+app.use('/api/teacher-applications', teacherApplicationRoutes);
 
 // Root (browser / health probes)
 app.get('/', (req, res) => {

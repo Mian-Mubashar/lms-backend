@@ -8,7 +8,8 @@
     "dev": "nodemon server.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "db:seed:demo-admin": "node seeder/demo-admin.js",
-    "db:verify:mongo": "node test-db.js"
+    "db:verify:mongo": "node test-db.js",
+    "test:email": "node scripts/test-email.js"
   },
   "keywords": [
     "lms",
