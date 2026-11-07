@@ -35,6 +35,11 @@ const readEnvFile = (filename) => {
 };
 
 const resolveEnvValue = (key) => {
+  const envValue = readEnvFile('.env')[key];
+  if (typeof envValue === 'string' && envValue.trim()) {
+    return envValue.trim();
+  }
+
   const runtimeValue = process.env[key];
   if (typeof runtimeValue === 'string' && runtimeValue.trim()) {
     return runtimeValue.trim();
@@ -45,18 +50,24 @@ const resolveEnvValue = (key) => {
     return runtimeFileValue.trim();
   }
 
-  const envValue = readEnvFile('.env')[key];
-  if (typeof envValue === 'string' && envValue.trim()) {
-    return envValue.trim();
-  }
-
   return '';
+};
+
+const GROQ_BASE_URL = 'https://api.groq.com/openai/v1';
+const GROQ_CHAT_MODEL = 'openai/gpt-oss-20b';
+
+const activeApiKey = () => resolveEnvValue('GROQ_API_KEY') || resolveEnvValue('OPENAI_API_KEY');
+const usingGroq = () => activeApiKey().startsWith('gsk_');
+
+const getChatModel = () => {
+  if (usingGroq()) return resolveEnvValue('GROQ_MODEL') || GROQ_CHAT_MODEL;
+  return resolveEnvValue('OPENAI_MODEL') || resolveEnvValue('OPENAI_ADMIN_MODEL') || 'gpt-4o-mini';
 };
 
 let openai = null;
 let openaiApiKeyCache = '';
 const getOpenAIClient = () => {
-  const key = resolveEnvValue('OPENAI_API_KEY');
+  const key = activeApiKey();
   if (!key) {
     openai = null;
     openaiApiKeyCache = '';
@@ -67,7 +78,10 @@ const getOpenAIClient = () => {
     return openai;
   }
 
-  openai = new OpenAI({ apiKey: key });
+  openai = new OpenAI({
+    apiKey: key,
+    ...(usingGroq() ? { baseURL: GROQ_BASE_URL } : {})
+  });
   openaiApiKeyCache = key;
   return openai;
 };
@@ -92,6 +106,28 @@ function parseAssistantJson(raw) {
   }
   return null;
 }
+
+/** Groq reasoning models reject response_format json_object (400 failed_generation). Ask for JSON in the prompt instead. */
+const requestJsonCompletion = async (client, payload) => {
+  const body = { ...payload };
+  if (!usingGroq()) {
+    body.response_format = { type: 'json_object' };
+  }
+
+  try {
+    const completion = await client.chat.completions.create(body);
+    const message = completion.choices[0]?.message || {};
+    const content = String(message.content || '').trim();
+    const reasoning = String(message.reasoning || '').trim();
+    if (parseAssistantJson(content)) return content;
+    if (reasoning) return reasoning;
+    return content;
+  } catch (apiErr) {
+    const failed = apiErr?.error?.failed_generation;
+    if (typeof failed === 'string' && parseAssistantJson(failed)) return failed;
+    throw apiErr;
+  }
+};
 
 // Lazy initialization function for Pinecone
 let pinecone = null;
@@ -176,7 +212,7 @@ router.post('/chat', async (req, res) => {
 
     // Get relevant course materials if courseId is provided
     let context = '';
-    if (courseId && pineconeIndexName && openaiClient) {
+    if (courseId && pineconeIndexName && openaiClient && !usingGroq()) {
       // Check if user has access to this course
       if (req.user.role === 'student') {
         const enrollment = await Enrollment.findOne({ studentId: req.user.id, courseId }).lean();
@@ -243,7 +279,7 @@ router.post('/chat', async (req, res) => {
 
     try {
       const completion = await openaiClient.chat.completions.create({
-        model: 'gpt-4',
+        model: getChatModel(),
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt }
@@ -252,8 +288,13 @@ router.post('/chat', async (req, res) => {
         max_tokens: 500
       });
 
-      const response = completion.choices[0].message.content;
-      return res.json({ response, source: 'openai' });
+      const choice = completion.choices[0]?.message || {};
+      const response = String(choice.content || '').trim();
+      if (!response) {
+        const localResponse = await buildLocalFallbackResponse();
+        return res.json({ response: localResponse, source: 'fallback' });
+      }
+      return res.json({ response, source: usingGroq() ? 'groq' : 'openai' });
     } catch (openaiError) {
       console.warn('OpenAI chat failed, using fallback:', openaiError.message);
       const localResponse = await buildLocalFallbackResponse();
@@ -373,17 +414,25 @@ router.post('/text-to-speech', async (req, res) => {
 
     if (!openaiClient) {
       return res.status(503).json({
-        message: 'OpenAI API is not configured. Please add OPENAI_API_KEY in .env or .env.runtime file'
+        message: 'AI API key is not configured. Add your Groq key as OPENAI_API_KEY in backend/.env'
       });
     }
-    const mp3 = await openaiClient.audio.speech.create({
-      model: 'tts-1',
-      voice: voice,
-      input: text.substring(0, 4096)
-    });
 
-    buffer = Buffer.from(await mp3.arrayBuffer());
-    audioFormat = 'mp3';
+    const speech = usingGroq()
+      ? await openaiClient.audio.speech.create({
+          model: 'canopylabs/orpheus-v1-english',
+          voice: 'hannah',
+          input: text.substring(0, 2000),
+          response_format: 'wav'
+        })
+      : await openaiClient.audio.speech.create({
+          model: 'tts-1',
+          voice,
+          input: text.substring(0, 4096)
+        });
+
+    buffer = Buffer.from(await speech.arrayBuffer());
+    audioFormat = usingGroq() ? 'wav' : 'mp3';
 
     // Instead of saving to the filesystem (which fails on Vercel's read-only filesystem),
     // we return the audio as a Base64 data URI so the frontend can play it directly.
@@ -430,7 +479,7 @@ By the end of this course, learners will be able to apply the key skills confide
     }
 
     const completion = await openaiClient.chat.completions.create({
-      model: 'gpt-4',
+      model: getChatModel(),
       messages: [
         {
           role: 'system',
@@ -612,7 +661,7 @@ router.post('/generate-quiz-questions', async (req, res) => {
     }
 
     const completion = await openaiClient.chat.completions.create({
-      model: 'gpt-4',
+      model: getChatModel(),
       messages: [
         {
           role: 'system',
@@ -720,8 +769,8 @@ router.post('/generate-assignment-template', async (req, res) => {
       });
     }
 
-    const completion = await openaiClient.chat.completions.create({
-      model: 'gpt-4',
+    const raw = await requestJsonCompletion(openaiClient, {
+      model: getChatModel(),
       messages: [
         {
           role: 'system',
@@ -750,18 +799,22 @@ Style guidance:
         }
       ],
       temperature: mode === 'strict' ? 0.45 : mode === 'creative' ? 0.8 : 0.65,
-      max_tokens: 420
+      max_tokens: usingGroq() ? 1400 : 700
     });
 
-    const raw = completion.choices[0].message.content.trim();
-    const sanitized = raw.replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
-    const parsed = JSON.parse(sanitized);
+    const parsed = parseAssistantJson(raw);
+    if (!parsed) {
+      console.warn('Generate assignment template: non-JSON model output, raw length', String(raw || '').length);
+      return res.status(502).json({
+        message: 'AI returned an unreadable draft. Please try Generate with AI again.'
+      });
+    }
     return res.json({
       title: parsed.title || `${topic} Assignment`,
       description: parsed.description || `Complete a ${normalizedType} task on ${topic}.`,
       instructions: parsed.instructions || '1) Review concepts\n2) Complete task\n3) Submit with explanation',
       rubric: Array.isArray(parsed.rubric) ? parsed.rubric : [],
-      source: 'openai',
+      source: usingGroq() ? 'groq' : 'openai',
       mode
     });
   } catch (error) {
@@ -795,7 +848,7 @@ router.post('/suggest-attendance-note', async (req, res) => {
     }
 
     const completion = await openaiClient.chat.completions.create({
-      model: 'gpt-4',
+      model: getChatModel(),
       messages: [
         {
           role: 'system',
@@ -879,7 +932,7 @@ router.post('/dashboard-insights', async (req, res) => {
     }
 
     const summaryText = JSON.stringify(analytics);
-    const insightModel = resolveEnvValue('OPENAI_ADMIN_MODEL') || 'gpt-4o-mini';
+    const insightModel = getChatModel();
 
     try {
       const completion = await openaiClient.chat.completions.create({
@@ -1022,7 +1075,7 @@ router.post('/pro-studio', async (req, res) => {
     }
 
     const completion = await openaiClient.chat.completions.create({
-      model: 'gpt-4',
+      model: getChatModel(),
       messages: [
         {
           role: 'system',
@@ -1116,7 +1169,7 @@ router.post('/exam-lab', async (req, res) => {
       }
 
       const completion = await openaiClient.chat.completions.create({
-        model: 'gpt-4',
+        model: getChatModel(),
         messages: [
           {
             role: 'system',
@@ -1172,7 +1225,7 @@ Context: ${promptContext || 'none'}`
     }
 
     const completion = await openaiClient.chat.completions.create({
-      model: 'gpt-4',
+      model: getChatModel(),
       messages: [
         {
           role: 'system',
@@ -1252,7 +1305,7 @@ router.post('/study-coach', async (req, res) => {
     }
 
     const completion = await openaiClient.chat.completions.create({
-      model: 'gpt-4',
+      model: getChatModel(),
       messages: [
         {
           role: 'system',
@@ -1370,10 +1423,10 @@ router.post('/admin/platform-brief', authorize('admin'), async (req, res) => {
       return res.json({ ...fallback, snapshot });
     }
 
-    const adminModel = resolveEnvValue('OPENAI_ADMIN_MODEL') || 'gpt-4o-mini';
-    let completion;
+    const adminModel = getChatModel();
+    let raw = '';
     try {
-      completion = await openaiClient.chat.completions.create({
+      raw = await requestJsonCompletion(openaiClient, {
       model: adminModel,
       messages: [
         {
@@ -1393,8 +1446,7 @@ Use only the facts from the snapshot JSON; do not invent numbers. If an optional
         }
       ],
       temperature: 0.35,
-      max_tokens: 900,
-      response_format: { type: 'json_object' }
+      max_tokens: 900
     });
     } catch (apiErr) {
       console.warn('AI admin platform-brief OpenAI call failed:', apiErr.message);
@@ -1406,7 +1458,6 @@ Use only the facts from the snapshot JSON; do not invent numbers. If an optional
       });
     }
 
-    const raw = completion.choices[0]?.message?.content?.trim() || '';
     const parsed = parseAssistantJson(raw);
     if (!parsed) {
       console.warn('AI admin platform-brief: non-JSON model output');
@@ -1418,7 +1469,7 @@ Use only the facts from the snapshot JSON; do not invent numbers. If an optional
       });
     }
     return res.json({
-      source: 'openai',
+      source: usingGroq() ? 'groq' : 'openai',
       title: parsed.title || fallback.title,
       executiveSummary: parsed.executiveSummary || fallback.executiveSummary,
       priorities: Array.isArray(parsed.priorities) ? parsed.priorities : fallback.priorities,
@@ -1458,10 +1509,10 @@ router.post('/admin/announcement-draft', authorize('admin'), async (req, res) =>
       return res.json(fallback);
     }
 
-    const adminModel = resolveEnvValue('OPENAI_ADMIN_MODEL') || 'gpt-4o-mini';
-    let completion;
+    const adminModel = getChatModel();
+    let raw = '';
     try {
-      completion = await openaiClient.chat.completions.create({
+      raw = await requestJsonCompletion(openaiClient, {
       model: adminModel,
       messages: [
         {
@@ -1480,8 +1531,7 @@ Do not use markdown code fences inside JSON string values.`
         }
       ],
       temperature: 0.45,
-      max_tokens: 700,
-      response_format: { type: 'json_object' }
+      max_tokens: 700
     });
     } catch (apiErr) {
       console.warn('AI admin announcement-draft OpenAI call failed:', apiErr.message);
@@ -1492,7 +1542,6 @@ Do not use markdown code fences inside JSON string values.`
       });
     }
 
-    const raw = completion.choices[0]?.message?.content?.trim() || '';
     const parsed = parseAssistantJson(raw);
     if (!parsed) {
       console.warn('AI admin announcement-draft: non-JSON model output, raw length', raw.length);
@@ -1503,7 +1552,7 @@ Do not use markdown code fences inside JSON string values.`
       });
     }
     return res.json({
-      source: 'openai',
+      source: usingGroq() ? 'groq' : 'openai',
       title: parsed.title || fallback.title,
       body: parsed.body || fallback.body,
       shortBlurb: parsed.shortBlurb || fallback.shortBlurb

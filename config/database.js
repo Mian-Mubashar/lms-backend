@@ -1,8 +1,13 @@
+const dns = require('dns');
+// ISP DNS often refuses Node SRV lookups (querySrv ECONNREFUSED) for mongodb+srv://.
+// Set this before mongoose loads so the first Atlas connect uses public DNS.
+dns.setServers(['8.8.8.8', '1.1.1.1']);
+
 const dotenv = require('dotenv');
 const mongoose = require('mongoose');
 
-dotenv.config({ path: '.env.runtime', override: true });
-dotenv.config({ override: false });
+dotenv.config({ path: '.env.runtime', override: false });
+dotenv.config({ path: '.env', override: true });
 
 const isCloudHost =
   Boolean(process.env.VERCEL) || process.env.NODE_ENV === 'production';
@@ -45,13 +50,15 @@ const connect = (callback) => {
       )
     );
   }
+  const options = { autoIndex: true };
   mongoose
-    .connect(uri, {
-      autoIndex: true
-    })
+    .connect(uri, options)
     .then(() => callback(null))
     .catch((err) => {
-      callback(err);
+      const srvRefused = err && err.code === 'ECONNREFUSED' && err.syscall === 'querySrv';
+      if (!srvRefused) return callback(err);
+      dns.setServers(['1.1.1.1', '8.8.8.8']);
+      mongoose.connect(uri, options).then(() => callback(null)).catch(callback);
     });
 };
 

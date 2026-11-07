@@ -3,7 +3,7 @@ const { authenticate, authorize } = require('../middleware/auth');
 const multer = require('multer');
 const fs = require('fs');
 const PDFDocument = require('pdfkit');
-const { Course, User, Enrollment, CourseMaterial, Assignment, AssignmentSubmission, Quiz, QuizAttempt } = require('../models');
+const { Course, User, Enrollment, CourseMaterial, Assignment, AssignmentSubmission, Quiz, QuizQuestion, QuizAttempt, Attendance, Feedback } = require('../models');
 
 const router = express.Router();
 const storage = multer.diskStorage({
@@ -154,6 +154,40 @@ router.put('/:id', authorize('teacher', 'admin'), upload.single('thumbnail'), as
     if (req.file) course.thumbnail = req.file.path;
     await course.save();
     res.json({ message: 'Course updated successfully', course: mapCourse(course) });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+router.delete('/:id', authorize('teacher', 'admin'), async (req, res) => {
+  try {
+    const course = await Course.findById(req.params.id);
+    if (!course) return res.status(404).json({ message: 'Course not found' });
+    if (req.user.role !== 'admin' && course.instructorId.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+
+    const courseId = course._id;
+    const [assignments, quizzes] = await Promise.all([
+      Assignment.find({ courseId }).select('_id').lean(),
+      Quiz.find({ courseId }).select('_id').lean()
+    ]);
+    const assignmentIds = assignments.map((item) => item._id);
+    const quizIds = quizzes.map((item) => item._id);
+
+    await Promise.all([
+      assignmentIds.length ? AssignmentSubmission.deleteMany({ assignmentId: { $in: assignmentIds } }) : Promise.resolve(),
+      quizIds.length ? QuizQuestion.deleteMany({ quizId: { $in: quizIds } }) : Promise.resolve(),
+      quizIds.length ? QuizAttempt.deleteMany({ quizId: { $in: quizIds } }) : Promise.resolve(),
+      Assignment.deleteMany({ courseId }),
+      Quiz.deleteMany({ courseId }),
+      Enrollment.deleteMany({ courseId }),
+      CourseMaterial.deleteMany({ courseId }),
+      Attendance.deleteMany({ courseId }),
+      Feedback.deleteMany({ courseId })
+    ]);
+    await course.deleteOne();
+    res.json({ message: 'Course deleted successfully' });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
   }
