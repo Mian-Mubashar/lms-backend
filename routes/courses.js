@@ -6,14 +6,17 @@ const PDFDocument = require('pdfkit');
 const { Course, User, Enrollment, CourseMaterial, Assignment, AssignmentSubmission, Quiz, QuizQuestion, QuizAttempt, Attendance, Feedback } = require('../models');
 
 const router = express.Router();
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const uploadPath = 'uploads/courses';
-    if (!fs.existsSync(uploadPath)) fs.mkdirSync(uploadPath, { recursive: true });
-    cb(null, uploadPath);
-  },
-  filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
-});
+const isVercel = Boolean(process.env.VERCEL);
+const storage = isVercel
+  ? multer.memoryStorage()
+  : multer.diskStorage({
+      destination: (req, file, cb) => {
+        const uploadPath = 'uploads/courses';
+        if (!fs.existsSync(uploadPath)) fs.mkdirSync(uploadPath, { recursive: true });
+        cb(null, uploadPath);
+      },
+      filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
+    });
 const upload = multer({ storage });
 router.use(authenticate);
 
@@ -138,7 +141,12 @@ router.get('/:id', async (req, res) => {
 router.post('/', authorize('teacher', 'admin'), upload.single('thumbnail'), async (req, res) => {
   try {
     const { title, description, category, status = 'draft' } = req.body;
-    const course = await Course.create({ title, description, instructorId: req.user.id, category, status, thumbnail: req.file ? req.file.path : null });
+    const thumbnail = req.file
+      ? (req.file.buffer
+          ? `data:${req.file.mimetype || 'image/jpeg'};base64,${req.file.buffer.toString('base64')}`
+          : req.file.path.replace(/\\/g, '/'))
+      : null;
+    const course = await Course.create({ title, description, instructorId: req.user.id, category, status, thumbnail });
     res.status(201).json({ message: 'Course created successfully', course: mapCourse(course) });
   } catch (error) {
     res.status(500).json({ message: 'Server error', error: error.message });
@@ -151,7 +159,11 @@ router.put('/:id', authorize('teacher', 'admin'), upload.single('thumbnail'), as
     if (!course) return res.status(404).json({ message: 'Course not found' });
     if (req.user.role !== 'admin' && course.instructorId.toString() !== req.user.id) return res.status(403).json({ message: 'Access denied' });
     ['title', 'description', 'category', 'status'].forEach((k) => { if (req.body[k]) course[k] = req.body[k]; });
-    if (req.file) course.thumbnail = req.file.path;
+    if (req.file) {
+      course.thumbnail = req.file.buffer
+        ? `data:${req.file.mimetype || 'image/jpeg'};base64,${req.file.buffer.toString('base64')}`
+        : req.file.path.replace(/\\/g, '/');
+    }
     await course.save();
     res.json({ message: 'Course updated successfully', course: mapCourse(course) });
   } catch (error) {

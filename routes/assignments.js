@@ -2,12 +2,14 @@ const express = require('express');
 const { authenticate, authorize } = require('../middleware/auth');
 const multer = require('multer');
 const fs = require('fs');
+const path = require('path');
 const { Assignment, Course, Enrollment, AssignmentSubmission, User } = require('../models');
 
+const isVercel = Boolean(process.env.VERCEL);
 const router = express.Router();
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    const uploadPath = 'uploads/assignments';
+    const uploadPath = isVercel ? path.join('/tmp', 'uploads', 'assignments') : 'uploads/assignments';
     if (!fs.existsSync(uploadPath)) fs.mkdirSync(uploadPath, { recursive: true });
     cb(null, uploadPath);
   },

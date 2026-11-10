@@ -7,23 +7,9 @@ const { User } = require('../models');
 
 const router = express.Router();
 
-const avatarStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => {
-    const uploadPath = 'uploads/avatars';
-    if (!fs.existsSync(uploadPath)) {
-      fs.mkdirSync(uploadPath, { recursive: true });
-    }
-    cb(null, uploadPath);
-  },
-  filename: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || '').toLowerCase() || '.jpg';
-    cb(null, `avatar-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`);
-  }
-});
-
 const avatarUpload = multer({
-  storage: avatarStorage,
-  limits: { fileSize: 2 * 1024 * 1024 },
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     if (file.mimetype && file.mimetype.startsWith('image/')) {
       cb(null, true);
@@ -40,11 +26,15 @@ const mapUser = (user) => ({
 });
 
 const deleteAvatarFile = (avatarPath) => {
-  if (!avatarPath || /^https?:\/\//i.test(avatarPath)) return;
-  const normalized = avatarPath.replace(/\\/g, '/');
-  const fullPath = path.join(process.cwd(), normalized);
-  if (fs.existsSync(fullPath)) {
-    fs.unlinkSync(fullPath);
+  if (!avatarPath || /^https?:\/\//i.test(avatarPath) || /^data:/i.test(avatarPath)) return;
+  try {
+    const normalized = avatarPath.replace(/\\/g, '/');
+    const fullPath = path.join(process.cwd(), normalized);
+    if (fs.existsSync(fullPath)) {
+      fs.unlinkSync(fullPath);
+    }
+  } catch (err) {
+    console.warn('Failed to delete avatar file:', err.message);
   }
 };
 
@@ -101,8 +91,15 @@ router.post('/:id/avatar', (req, res, next) => {
       deleteAvatarFile(existing.avatar);
     }
 
-    const avatarPath = req.file.path.replace(/\\/g, '/');
-    existing.avatar = avatarPath;
+    let avatarData = '';
+    if (req.file.buffer) {
+      const mime = req.file.mimetype || 'image/jpeg';
+      avatarData = `data:${mime};base64,${req.file.buffer.toString('base64')}`;
+    } else if (req.file.path) {
+      avatarData = req.file.path.replace(/\\/g, '/');
+    }
+
+    existing.avatar = avatarData;
     await existing.save();
 
     res.json({
