@@ -615,7 +615,7 @@ router.post('/generate-quiz-questions', async (req, res) => {
 
         const qType = q.questionType || questionType;
         let options = Array.isArray(q.options) ? q.options.filter(Boolean) : [];
-        let correctAnswer = q.correctAnswer || '';
+        let correctAnswer = q.correctAnswer || q.answer || q.correct_answer || '';
 
         if (qType === 'multiple_choice') {
           if (options.length < 4) {
@@ -660,58 +660,83 @@ router.post('/generate-quiz-questions', async (req, res) => {
       return res.json({ questions: buildFallbackQuestions(), source: 'fallback_no_openai' });
     }
 
-    const completion = await openaiClient.chat.completions.create({
-      model: getChatModel(),
-      messages: [
-        {
-          role: 'system',
-          content: `You generate valid JSON quiz questions for LMS.
-Return ONLY JSON array. No markdown, no explanation.
-All questions MUST be unique (no duplicates or paraphrase duplicates).
-Schema for each item:
-{
-  "question": "string",
-  "questionType": "multiple_choice|true_false|short_answer",
-  "options": ["string"] (for multiple_choice exactly 4 realistic options),
-  "correctAnswer": "string",
-  "points": 1
-}`
-        },
-        {
-          role: 'user',
-          content: `Generate ${normalizedCount} ${difficulty} ${questionType} questions about: ${topic}.
-For multiple choice, provide 4 distinct options and ensure correctAnswer exactly matches one option.
-Generation mode: ${mode}.
-- fast: concise and straightforward
-- accurate: conceptually correct and practical
-- exam: scenario-based and analytical`
-        }
-      ],
-      temperature: mode === 'fast' ? 0.5 : mode === 'exam' ? 0.8 : 0.65,
-      max_tokens: 1200
-    });
-
     let parsedQuestions = [];
-    const raw = completion.choices[0].message.content.trim();
+    let usedSource = usingGroq() ? 'groq' : 'openai';
     try {
-      parsedQuestions = JSON.parse(raw);
-    } catch (parseError) {
-      console.warn('AI question parse failed, using fallback parser:', parseError.message);
+      const completion = await openaiClient.chat.completions.create({
+        model: getChatModel(),
+        messages: [
+          {
+            role: 'system',
+            content: `You generate valid JSON quiz questions for LMS.
+Return ONLY valid JSON array of objects. No markdown formatting, no code fences.
+Schema:
+[
+  {
+    "question": "string",
+    "questionType": "${questionType}",
+    "options": ["string", "string", "string", "string"],
+    "correctAnswer": "string (must match one option)",
+    "points": 1
+  }
+]`
+          },
+          {
+            role: 'user',
+            content: `Generate ${normalizedCount} ${difficulty} ${questionType} questions about: ${topic}.
+Mode: ${mode}.
+Ensure questions are clear, distinct, and high quality.`
+          }
+        ],
+        temperature: mode === 'fast' ? 0.5 : mode === 'exam' ? 0.8 : 0.65,
+        max_tokens: usingGroq() ? 1600 : 1200
+      });
+
+      const message = completion.choices[0]?.message || {};
+      const raw = String(message.content || message.reasoning || '').trim();
+
       try {
-        const sanitized = raw.replace(/^```json/i, '').replace(/^```/, '').replace(/```$/, '').trim();
-        parsedQuestions = JSON.parse(sanitized);
-      } catch (secondParseError) {
-        console.warn('Sanitized parse failed, using generated fallback questions:', secondParseError.message);
+        const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+        const jsonMatch = cleaned.match(/\[\s*\{[\s\S]*\}\s*\]/);
+        parsedQuestions = JSON.parse(jsonMatch ? jsonMatch[0] : cleaned);
+      } catch (parseError) {
+        console.warn('AI question parse failed, using fallback:', parseError.message);
         parsedQuestions = buildFallbackQuestions();
+        usedSource = 'fallback_parse_error';
       }
+    } catch (apiError) {
+      console.warn('AI quiz questions generation API failed, using smart fallback:', apiError.message);
+      parsedQuestions = buildFallbackQuestions();
+      usedSource = 'fallback_on_error';
+    }
+
+    if (!Array.isArray(parsedQuestions) || parsedQuestions.length === 0) {
+      parsedQuestions = buildFallbackQuestions();
     }
 
     const normalizedQuestions = normalizeAndDedupe(parsedQuestions);
 
-    return res.json({ questions: normalizedQuestions, source: 'openai', mode });
+    return res.json({
+      questions: normalizedQuestions,
+      source: usedSource,
+      mode
+    });
   } catch (error) {
     console.error('Generate quiz questions error:', error);
-    return res.status(500).json({ message: 'Server error', error: error.message });
+    try {
+      const { topic = 'Web Development', count = 5 } = req.body || {};
+      const normalizedCount = Math.min(Math.max(Number(count) || 5, 1), 10);
+      const fallback = Array.from({ length: normalizedCount }).map((_, i) => ({
+        question: `Which concept is essential when working with ${topic}? (Part ${i + 1})`,
+        questionType: 'multiple_choice',
+        options: [`${topic} Core Principle`, 'Incorrect Syntax', 'Deprecated Feature', 'Unrelated Module'],
+        correctAnswer: `${topic} Core Principle`,
+        points: 1
+      }));
+      return res.json({ questions: fallback, source: 'fallback_error', mode: 'accurate' });
+    } catch {
+      return res.status(500).json({ message: 'Server error', error: error.message });
+    }
   }
 });
 
@@ -819,7 +844,15 @@ Style guidance:
     });
   } catch (error) {
     console.error('Generate assignment template error:', error);
-    return res.status(500).json({ message: 'Server error', error: error.message });
+    const { topic = 'Assignment', courseTitle = '', level = 'intermediate', assignmentType = 'practical' } = req.body || {};
+    return res.json({
+      title: `${topic} Practical Task`,
+      description: `Complete a ${level}-level ${assignmentType} assignment on "${topic}" for ${courseTitle || 'this course'}.`,
+      instructions: `1) Review the core concepts of ${topic}\n2) Build and test your implementation\n3) Submit your work with concise reasoning and results`,
+      rubric: ['Concept accuracy (40%)', 'Clarity and structure (30%)', 'Practical relevance (30%)'],
+      source: 'fallback_on_error',
+      mode: 'balanced'
+    });
   }
 });
 
@@ -867,7 +900,9 @@ router.post('/suggest-attendance-note', async (req, res) => {
     return res.json({ note: completion.choices[0].message.content.trim(), source: 'openai' });
   } catch (error) {
     console.error('Suggest attendance note error:', error);
-    return res.status(500).json({ message: 'Server error', error: error.message });
+    const { status = 'present', studentName = 'Student' } = req.body || {};
+    const fallbackNote = `${studentName} attendance recorded as ${status}.`;
+    return res.json({ note: fallbackNote, source: 'fallback_on_error' });
   }
 });
 
