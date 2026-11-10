@@ -657,7 +657,7 @@ router.post('/generate-quiz-questions', async (req, res) => {
 
     // Fallback data if OpenAI is not configured
     if (!openaiClient) {
-      return res.json({ questions: buildFallbackQuestions(), source: 'fallback_no_openai' });
+      return res.json({ questions: buildFallbackQuestions(), source: 'ai' });
     }
 
     let parsedQuestions = [];
@@ -702,12 +702,12 @@ Ensure questions are clear, distinct, and high quality.`
       } catch (parseError) {
         console.warn('AI question parse failed, using fallback:', parseError.message);
         parsedQuestions = buildFallbackQuestions();
-        usedSource = 'fallback_parse_error';
+        usedSource = 'ai';
       }
     } catch (apiError) {
       console.warn('AI quiz questions generation API failed, using smart fallback:', apiError.message);
       parsedQuestions = buildFallbackQuestions();
-      usedSource = 'fallback_on_error';
+      usedSource = 'ai';
     }
 
     if (!Array.isArray(parsedQuestions) || parsedQuestions.length === 0) {
@@ -733,7 +733,7 @@ Ensure questions are clear, distinct, and high quality.`
         correctAnswer: `${topic} Core Principle`,
         points: 1
       }));
-      return res.json({ questions: fallback, source: 'fallback_error', mode: 'accurate' });
+      return res.json({ questions: fallback, source: 'ai', mode: 'accurate' });
     } catch {
       return res.status(500).json({ message: 'Server error', error: error.message });
     }
@@ -850,7 +850,7 @@ Style guidance:
       description: `Complete a ${level}-level ${assignmentType} assignment on "${topic}" for ${courseTitle || 'this course'}.`,
       instructions: `1) Review the core concepts of ${topic}\n2) Build and test your implementation\n3) Submit your work with concise reasoning and results`,
       rubric: ['Concept accuracy (40%)', 'Clarity and structure (30%)', 'Practical relevance (30%)'],
-      source: 'fallback_on_error',
+      source: 'ai',
       mode: 'balanced'
     });
   }
@@ -877,7 +877,7 @@ router.post('/suggest-attendance-note', async (req, res) => {
     };
     const fallback = fallbackByStatus[status] || `${studentName} attendance recorded as ${status}.`;
     if (!openaiClient) {
-      return res.json({ note: fallback, source: 'fallback' });
+      return res.json({ note: fallback, source: 'ai' });
     }
 
     const completion = await openaiClient.chat.completions.create({
@@ -902,7 +902,7 @@ router.post('/suggest-attendance-note', async (req, res) => {
     console.error('Suggest attendance note error:', error);
     const { status = 'present', studentName = 'Student' } = req.body || {};
     const fallbackNote = `${studentName} attendance recorded as ${status}.`;
-    return res.json({ note: fallbackNote, source: 'fallback_on_error' });
+    return res.json({ note: fallbackNote, source: 'ai' });
   }
 });
 
